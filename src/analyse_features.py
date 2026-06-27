@@ -3,98 +3,86 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 
 # --- SMART PATHING ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 # File Paths
-FEATURES_CSV = os.path.join(PROJECT_ROOT, "data", "processed", "extracted_features.csv")
-DEMENTIA_CSV = os.path.join(PROJECT_ROOT, "master_key.csv") 
-HEALTHY_CSV = os.path.join(PROJECT_ROOT, "healthy_master_key.csv") 
+TRAIN_CSV = os.path.join(PROJECT_ROOT, "data", "metadata", "training data (70%)", "train.csv")
 REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports")
 
 def main():
     if not os.path.exists(REPORTS_DIR):
         os.makedirs(REPORTS_DIR)
 
-    print("Loading extracted features and master keys...")
+    print("Loading training data for dimensionality reduction...")
     try:
-        features_df = pd.read_csv(FEATURES_CSV)
-        dementia_df = pd.read_csv(DEMENTIA_CSV)
-        healthy_df = pd.read_csv(HEALTHY_CSV)
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
+        df = pd.read_csv(TRAIN_CSV)
+    except FileNotFoundError:
+        print("Error: Could not find train.csv. Run create_splits.py first!")
         return
-
-    # --- 1. CLEAN AND UNIFY THE DATA ---
-    print("Unifying Healthy and Dementia master keys...")
     
-    # Standardize names by removing spaces and making lowercase (e.g., "Abe Burrows" -> "abeburrows")
-    dementia_df['join_key'] = dementia_df['name'].astype(str).str.lower().str.replace(' ', '', regex=False)
-    healthy_df['join_key'] = healthy_df['name'].astype(str).str.lower().str.replace(' ', '', regex=False)
-    
-    # The audio files might have spaces in the names now too (e.g., "Mel brooks_1.wav" -> "melbrooks")
-    features_df['join_key'] = features_df['Filename'].str.split('_').str[0].str.lower().str.replace(' ', '', regex=False)
-
-    # Grab labels from Dementia sheet
-    dementia_subset = dementia_df[['join_key', 'dementia type']].rename(columns={'dementia type': 'Label'})
-    
-    # Grab names from Healthy sheet and explicitly label them "Healthy"
-    healthy_subset = healthy_df[['join_key']].copy()
-    healthy_subset['Label'] = 'Healthy'
-
-    # Stack them together into one master dataset
-    unified_master = pd.concat([dementia_subset, healthy_subset], ignore_index=True).drop_duplicates(subset=['join_key'])
-
-    # --- 2. MERGE WITH AUDIO MATH ---
-    df = pd.merge(features_df, unified_master, on='join_key', how='inner')
-    
-    print(f"Success! Matched {len(df)} audio files to their diagnoses.")
-    print("Class breakdown:")
-    print(df['Label'].value_counts())
-
-    # Create a binary label strictly for the baseline model (Sick vs. Healthy)
+# Create the binary label for the 1D test
     df['Binary_Label'] = df['Label'].apply(lambda x: 'Healthy' if x == 'Healthy' else 'Dementia')
 
-    # --- 3. PREPARE X AND y ---
-    feature_cols = [col for col in features_df.columns if col not in ['Filename', 'join_key']]
-    X = df[feature_cols].fillna(0)
-    y = df['Binary_Label']
+    # Grab the math (ignore the string/metadata columns)
+    feature_cols = [col for col in df.columns if col not in ['Filename', 'join_key', 'Label', 'Binary_Label']]
+    X = df[feature_cols].fillna(0).values
 
-    # --- 4. STANDARD SCALER ---
-    print("\nStandardizing features...")
+    # --- 2. STANDARD SCALER ---
+    print("Standardizing features...")
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # --- 5. PCA ---
-    print("Running PCA...")
-    pca = PCA(n_components=2)
-    X_pca = pca.fit_transform(X_scaled)
+    # --- 3. LDA (BINARY 1D DENSITY PLOT) ---
+    print("Running 1D LDA for Baseline (Healthy vs. Dementia)...")
+    lda_1d = LDA(n_components=1)
     
-    var_1 = pca.explained_variance_ratio_[0] * 100
-    var_2 = pca.explained_variance_ratio_[1] * 100
+    # Notice we feed it 'Binary_Label' so it explicitly knows what to separate
+    X_lda_1d = lda_1d.fit_transform(X_scaled, df['Binary_Label'])
 
-    # --- 6. PLOT ---
-    print("Plotting and saving graph...")
-    plt.figure(figsize=(10, 7))
-    
-    sns.scatterplot(
-        x=X_pca[:, 0], y=X_pca[:, 1], 
-        hue=y, 
+    plt.figure(figsize=(10, 5))
+    sns.kdeplot(
+        x=X_lda_1d[:, 0], 
+        hue=df['Binary_Label'], 
+        fill=True, 
         palette={"Healthy": "#2ecc71", "Dementia": "#e74c3c"}, 
-        alpha=0.8, s=100, edgecolor='w'
+        alpha=0.6, linewidth=2
     )
-    
-    plt.title("PCA of Audio Features (Speakcare Baseline)", fontsize=15, pad=15)
-    plt.xlabel(f"Principal Component 1 ({var_1:.1f}% Variance Explained)", fontsize=12)
-    plt.ylabel(f"Principal Component 2 ({var_2:.1f}% Variance Explained)", fontsize=12)
+    plt.title("1D LDA Density: Baseline Separability (Sick vs. Healthy)", fontsize=14, pad=15)
+    plt.xlabel("Linear Discriminant 1 (Maximized Between-Class Scatter)")
+    plt.ylabel("Density of Audio Files")
     plt.grid(True, linestyle='--', alpha=0.5)
     
-    output_path = os.path.join(REPORTS_DIR, "pca_analysis.png")
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"\nTask 3 Complete! Saved PCA plot to: {output_path}")
+    out_1d = os.path.join(REPORTS_DIR, "lda_1d_binary.png")
+    plt.savefig(out_1d, dpi=300, bbox_inches='tight')
+
+    # --- 4. LDA (MULTI-CLASS 2D SCATTER PLOT) ---
+    print("Running 2D LDA for Sub-types...")
+    # Because there are 6 classes in 'Label', we can extract 2 components
+    lda_2d = LDA(n_components=2)
+    X_lda_2d = lda_2d.fit_transform(X_scaled, df['Label'])
+
+    plt.figure(figsize=(12, 8))
+    sns.scatterplot(
+        x=X_lda_2d[:, 0], y=X_lda_2d[:, 1], 
+        hue=df['Label'], 
+        palette="bright", 
+        alpha=0.8, s=100, edgecolor='w'
+    )
+    plt.title("2D LDA Scatter: Multi-Class Separability", fontsize=15, pad=15)
+    plt.xlabel("Linear Discriminant 1")
+    plt.ylabel("Linear Discriminant 2")
+    plt.legend(title="Diagnosis", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    out_2d = os.path.join(REPORTS_DIR, "lda_2d_multiclass.png")
+    plt.savefig(out_2d, dpi=300, bbox_inches='tight')
+
+    print(f"\nSuccess! Saved 1D Density to: {out_1d}")
+    print(f"Success! Saved 2D Scatter to: {out_2d}")
 
 if __name__ == "__main__":
     main()
